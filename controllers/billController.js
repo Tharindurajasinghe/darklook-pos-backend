@@ -14,11 +14,17 @@ async function generateBillId() {
 
 const createBill = async (req, res) => {
   try {
-    const { items, cash } = req.body;
+    const { items, cash, customerName } = req.body;
     
     let totalAmount = 0;
     const billItems = [];
-    
+
+    // ── FIX 1: Validate ALL items FIRST before touching any stock ──────────
+    // Collect resolved product data in a first pass (read-only).
+    // Stock is only deducted after every validation passes including cash check.
+    // This prevents partial stock deductions when a later item fails validation.
+    const resolvedItems = [];
+
     for (const item of items) {
       // Use 'Standard' as default variant if not provided (BACKWARD COMPATIBLE)
       const finalVariant = item.variant || 'Standard';
@@ -35,7 +41,7 @@ const createBill = async (req, res) => {
         });
       }
       
-      // ✅ VALIDATE QUANTITY BASED ON UNIT
+      // VALIDATE QUANTITY BASED ON UNIT
       const quantity = parseFloat(item.quantity);
       
       // For "unit" (pieces), quantity must be whole number
@@ -76,26 +82,32 @@ const createBill = async (req, res) => {
       const originalPrice = (item.price !== undefined && item.originalPrice !== undefined)
         ? item.originalPrice
         : null;
-      
+
+      // Store resolved data for second pass
+      resolvedItems.push({ product, quantity, finalPrice, originalPrice, itemTotal, finalVariant });
+
       billItems.push({
         productId: product.productId,
         name: product.name,
         variant: finalVariant,
         quantity: quantity,
-        price: finalPrice,          // actual price charged (possibly edited)
-        originalPrice: originalPrice, // original selling price (null if not edited)
+        price: finalPrice,
+        originalPrice: originalPrice,
         buyingPrice: product.buyingPrice,
         total: itemTotal,
         unit: product.unit
       });
-      
-      // Reduce stock
-      product.stock -= quantity;
-      await product.save();
     }
-    
+
+    // ── FIX 1: Cash check BEFORE any stock is touched ──────────────────────
     if (cash < totalAmount) {
       return res.status(400).json({ message: 'Insufficient cash' });
+    }
+
+    // ── FIX 1: All validations passed — now deduct stock ───────────────────
+    for (const { product, quantity } of resolvedItems) {
+      product.stock -= quantity;
+      await product.save();
     }
 
     const change = cash - totalAmount;
@@ -107,6 +119,7 @@ const createBill = async (req, res) => {
     const time = now.format('hh:mm A');
     
     const bill = new Bill({
+      customerName: (customerName || '').trim(),
       billId,
       items: billItems,
       totalAmount,
@@ -118,21 +131,25 @@ const createBill = async (req, res) => {
     });
     
     await bill.save();
-    
-    let activeDay = await ActiveDay.findOne({ date: dayIdentifier });
-    if (!activeDay) {
-      activeDay = new ActiveDay({
-        date: dayIdentifier,
-        startedAt: now.toDate(),
-        currentTotal: totalAmount
-      });
-    } else {
-      activeDay.currentTotal += totalAmount;
-    }
-    await activeDay.save();
+
+    // ── FIX 5: Use $inc for atomic increment on currentTotal ───────────────
+    // Prevents race condition where two bills read the same currentTotal
+    // and overwrite each other — $inc is a single atomic DB operation
+    await ActiveDay.findOneAndUpdate(
+      { date: dayIdentifier },
+      {
+        $inc: { currentTotal: totalAmount },
+        $setOnInsert: { startedAt: now.toDate(), isActive: true }
+      },
+      { upsert: true, new: true }
+    );
     
     res.status(201).json(bill);
   } catch (err) {
+    // ── FIX 2: If duplicate billId race condition, give clear message ───────
+    if (err.code === 11000 && err.message && err.message.includes('billId')) {
+      return res.status(400).json({ message: 'Bill ID conflict — please try saving again' });
+    }
     res.status(400).json({ message: err.message });
   }
 };
@@ -141,7 +158,7 @@ const createBill = async (req, res) => {
 const getTodayBills = async (req, res) => {
   try {
     const today = moment().tz('Asia/Colombo').format('YYYY-MM-DD');
-    const bills = await Bill.find({ dayIdentifier: today }).sort({ createdAt: 1 });
+    const bills = await Bill.find({ dayIdentifier: today }).sort({ createdAt: -1 });
     res.json(bills);
   } catch (err) {
     res.status(500).json({ message: err.message });
@@ -151,7 +168,7 @@ const getTodayBills = async (req, res) => {
 // Get bills by date
 const getBillsByDate = async (req, res) => {
   try {
-    const bills = await Bill.find({ dayIdentifier: req.params.date }).sort({ createdAt: 1 });
+    const bills = await Bill.find({ dayIdentifier: req.params.date }).sort({ createdAt: -1 });
     res.json(bills);
   } catch (err) {
     res.status(500).json({ message: err.message });

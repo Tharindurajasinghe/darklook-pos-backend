@@ -6,6 +6,11 @@ const billSchema = new mongoose.Schema({
     required: true,
     unique: true
   },
+  customerName: {
+    type: String,
+    trim: true,
+    default: ''   // optional — empty string means no name entered
+  },
   items: [{
     productId: String,
     name: String,
