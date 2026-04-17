@@ -217,6 +217,17 @@ const updateProduct = async (req, res) => {
       
       product.unit = unit;
     }
+
+    // UPDATE VARIANT NAME: if a new variant name is provided in body, rename it
+if (req.body.variant !== undefined && req.body.variant.trim() !== finalVariant) {
+  const newVariantName = req.body.variant.trim() || 'Standard';
+  // Check no other document with same productId already uses this variant name
+  const clash = await Product.findOne({ productId: id, variant: newVariantName, _id: { $ne: product._id } });
+  if (clash) {
+    return res.status(400).json({ message: `Variant name "${newVariantName}" already exists for this product` });
+  }
+  product.variant = newVariantName;
+}
     
     if (name) product.name = name;
     if (stock !== undefined) {
